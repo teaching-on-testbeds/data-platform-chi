@@ -1,0 +1,7 @@
+server:
+  port: 8182
+  host: 0.0.0.0
+database:
+  url: jdbc:postgresql://postgres:5432/nimtable
+  username: nimtable_user
+  password: gourmetgram_nimtable

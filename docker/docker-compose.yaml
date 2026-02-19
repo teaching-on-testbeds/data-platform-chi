@@ -1,0 +1,526 @@
+services:
+
+  # ETL: Extract - Download Food-11 dataset
+  extract-data:
+    container_name: extract
+    image: python:3.11
+    user: root
+    volumes:
+      - food11:/data
+    working_dir: /data
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+
+        echo "Resetting dataset directory..."
+        rm -rf Food-11
+        mkdir -p Food-11
+        cd Food-11
+
+        echo "Downloading dataset zip..."
+        curl -L https://nyu.box.com/shared/static/m5kvcl25hfpljul3elhu6xz8y2w61op4.zip \
+          -o Food-11.zip
+
+        echo "Unzipping dataset..."
+        unzip -q Food-11.zip
+        rm -f Food-11.zip
+
+        echo ""
+        echo "========== EXTRACT STAGE SUMMARY =========="
+        echo "Contents of /data:"
+        ls -l /data
+        echo ""
+        echo "Item counts per folder:"
+        for dir in /data/Food-11/*/; do
+          count=$$(find "$$dir" -type f | wc -l)
+          echo "  $$(basename $$dir): $$count items"
+        done
+        total=$$(find /data/Food-11 -type f | wc -l)
+        echo "----------------------------------------"
+        echo "TOTAL ITEMS: $$total"
+        echo "==========================================="
+
+  # ETL: Transform - Organize into class folders
+  transform-data:
+    container_name: transform
+    image: python:3.11
+    volumes:
+      - food11:/data
+    working_dir: /data/Food-11
+    depends_on:
+      extract-data:
+        condition: service_completed_successfully
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+
+        python3 -c '
+        import os
+        import shutil
+
+        dataset_base_dir = "/data/Food-11"
+        subdirs = ["training", "validation", "evaluation"]
+        classes = [
+            "Bread", "Dairy product", "Dessert", "Egg", "Fried food",
+            "Meat", "Noodles/Pasta", "Rice", "Seafood", "Soup", "Vegetable/Fruit"
+        ]
+
+        for subdir in subdirs:
+            dir_path = os.path.join(dataset_base_dir, subdir)
+            if not os.path.exists(dir_path):
+                continue
+
+            for i, class_name in enumerate(classes):
+                class_dir = os.path.join(dir_path, f"class_{i:02d}")
+                os.makedirs(class_dir, exist_ok=True)
+                for f in os.listdir(dir_path):
+                    if f.startswith(f"{i}_"):
+                        shutil.move(
+                            os.path.join(dir_path, f),
+                            os.path.join(class_dir, f)
+                        )
+        '
+
+        echo ""
+        echo "========== TRANSFORM STAGE SUMMARY =========="
+        echo "Contents of /data/Food-11:"
+        ls -l /data/Food-11
+        echo ""
+        for split in training validation evaluation; do
+          if [ -d "/data/Food-11/$$split" ]; then
+            echo "--- $$split ---"
+            for class_dir in /data/Food-11/$$split/*/; do
+              count=$$(find "$$class_dir" -type f | wc -l)
+              echo "  $$(basename $$class_dir): $$count items"
+            done
+            split_total=$$(find /data/Food-11/$$split -type f | wc -l)
+            echo "  SUBTOTAL: $$split_total"
+            echo ""
+          fi
+        done
+        total=$$(find /data/Food-11 -type f | wc -l)
+        echo "----------------------------------------"
+        echo "TOTAL ITEMS: $$total"
+        echo "============================================="
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:18
+    container_name: postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: gourmetgram_postgres
+      POSTGRES_DB: gourmetgram
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./init_sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U user -d gourmetgram" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # MinIO Object Storage
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: gourmetgram_minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Create required MinIO buckets
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z-cpuv1
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        mc alias set myminio http://minio:9000 admin gourmetgram_minio
+        mc mb --ignore-existing myminio/gourmetgram-datalake
+        mc mb --ignore-existing myminio/gourmetgram-images
+        echo "Buckets created successfully"
+
+  # RedPanda (Kafka-compatible message broker)
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.3.7
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --smp 1
+      - --memory 1G
+      - --mode dev-container
+      - --set redpanda.log_retention_ms=2592000000  # 30 days retention
+      - --set redpanda.log_segment_ms=3600000       # 1-hour segments
+    ports:
+      - "18081:18081" # Schema Registry
+      - "18082:18082" # Pandaproxy
+      - "19092:19092" # Kafka API
+      - "19644:9644" # Admin API
+    healthcheck:
+      test: [ "CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1" ]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  # Redis (Real-time feature store)
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    command: redis-server --appendonly yes
+
+  # FastAPI Service v1 (Postgres + MinIO only)
+  api_v1:
+    build:
+      context: ../api_v1
+      dockerfile: Dockerfile
+    container_name: api-v1
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:gourmetgram_postgres@postgres:5432/gourmetgram
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=gourmetgram_minio
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_BUCKET_NAME=gourmetgram-images
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    volumes:
+      - ../api_v1/app:/code/app
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      default:
+        aliases:
+          - api
+
+  # FastAPI Service v2 (streaming-enabled)
+  api_v2:
+    build:
+      context: ../api_v2
+      dockerfile: Dockerfile
+    container_name: api-v2
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:gourmetgram_postgres@postgres:5432/gourmetgram
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=gourmetgram_minio
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_BUCKET_NAME=gourmetgram-images
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - KAFKA_TOPIC_UPLOADS=gourmetgram.uploads
+      - KAFKA_TOPIC_VIEWS=gourmetgram.views
+      - KAFKA_TOPIC_COMMENTS=gourmetgram.comments
+      - KAFKA_TOPIC_FLAGS=gourmetgram.flags
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - ../api_v2/app:/code/app
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      default:
+        aliases:
+          - api
+
+  # Data Generator
+  data_generator:
+    build:
+      context: ../data_generator
+      dockerfile: Dockerfile
+    container_name: generator
+    environment:
+      - GENERATOR_API_URL=http://api:8000
+      - GENERATOR_DATASET_PATH=/data/Food-11
+      - GENERATOR_ARRIVAL_RATE=3000.0
+      - GENERATOR_INITIAL_USERS=10
+      - GENERATOR_INITIAL_IMAGES=20
+      - GENERATOR_LOG_LEVEL=INFO
+    depends_on:
+      transform-data:
+        condition: service_completed_successfully
+    volumes:
+      - food11:/data:ro
+    restart: unless-stopped
+
+  # Stream Consumer (Real-time Aggregations)
+  stream_consumer:
+    build:
+      context: ../stream_consumer
+      dockerfile: Dockerfile
+    container_name: stream-consumer
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - KAFKA_CONSUMER_GROUP=gourmetgram-stream-consumer
+      - KAFKA_TOPICS=gourmetgram.views,gourmetgram.comments,gourmetgram.uploads,gourmetgram.flags
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - DATABASE_URL=postgresql://user:gourmetgram_postgres@postgres:5432/gourmetgram
+      - LOG_LEVEL=INFO
+      - VIRAL_THRESHOLD_VIEWS_5MIN=100
+      - SUSPICIOUS_THRESHOLD_COMMENTS_1MIN=10
+      - POPULAR_THRESHOLD_VIEWS_1HR=50
+      - MODERATION_TOPIC=gourmetgram.moderation_requests
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Risk Scoring Service
+  risk_scoring_service:
+    build:
+      context: ../inference_service
+      dockerfile: Dockerfile
+    container_name: risk-scoring-service
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - KAFKA_CONSUMER_GROUP=gourmetgram-moderation
+      - MODERATION_TOPIC=gourmetgram.moderation_requests
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - DATABASE_URL=postgresql://user:gourmetgram_postgres@postgres:5432/gourmetgram
+      - S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=gourmetgram_minio
+      - MODEL_BUCKET=gourmetgram-datalake
+      - MODEL_PREFIX=models/moderation/
+      - MODEL_CHECK_INTERVAL=30
+      - LOG_LEVEL=INFO
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Airflow Services
+  airflow-init:
+    build:
+      context: ../batch-etl-airflow
+      dockerfile: Dockerfile
+    user: root
+    container_name: airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://user:gourmetgram_postgres@postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db init
+        airflow users create --username admin --password gourmetgram_airflow --firstname Admin --lastname User --role Admin --email admin@example.com || true
+        airflow connections add 'gourmetgram_postgres' --conn-uri 'postgresql://user:gourmetgram_postgres@postgres:5432/gourmetgram' || true
+        airflow connections add 'gourmetgram_minio' --conn-type 'aws' --conn-login 'admin' --conn-password 'gourmetgram_minio' --conn-extra '{"endpoint_url": "http://minio:9000"}' || true
+
+  airflow-webserver:
+    build:
+      context: ../batch-etl-airflow
+      dockerfile: Dockerfile
+    user: root
+    container_name: airflow-webserver
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://user:gourmetgram_postgres@postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=True
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      # PyIceberg Configuration
+      - PYICEBERG_CATALOG__GOURMETGRAM__TYPE=sql
+      - PYICEBERG_CATALOG__GOURMETGRAM__URI=postgresql+psycopg2://user:gourmetgram_postgres@postgres:5432/iceberg_catalog
+      - PYICEBERG_CATALOG__GOURMETGRAM__S3__ENDPOINT=http://minio:9000
+      - PYICEBERG_CATALOG__GOURMETGRAM__S3__ACCESS_KEY_ID=admin
+      - PYICEBERG_CATALOG__GOURMETGRAM__S3__SECRET_ACCESS_KEY=gourmetgram_minio
+      - PYICEBERG_CATALOG__GOURMETGRAM__WAREHOUSE=s3://gourmetgram-datalake/warehouse
+    command: webserver
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../batch-etl-airflow/dags:/opt/airflow/dags
+      - ../batch-etl-airflow/plugins:/opt/airflow/plugins
+      - ../batch-etl-airflow/logs:/opt/airflow/logs
+
+  airflow-scheduler:
+    build:
+      context: ../batch-etl-airflow
+      dockerfile: Dockerfile
+    user: root
+    container_name: airflow-scheduler
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://user:gourmetgram_postgres@postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      # PyIceberg Configuration
+      - PYICEBERG_CATALOG__GOURMETGRAM__TYPE=sql
+      - PYICEBERG_CATALOG__GOURMETGRAM__URI=postgresql+psycopg2://user:gourmetgram_postgres@postgres:5432/iceberg_catalog
+      - PYICEBERG_CATALOG__GOURMETGRAM__S3__ENDPOINT=http://minio:9000
+      - PYICEBERG_CATALOG__GOURMETGRAM__S3__ACCESS_KEY_ID=admin
+      - PYICEBERG_CATALOG__GOURMETGRAM__S3__SECRET_ACCESS_KEY=gourmetgram_minio
+      - PYICEBERG_CATALOG__GOURMETGRAM__WAREHOUSE=s3://gourmetgram-datalake/warehouse
+    command: scheduler
+    volumes:
+      - ../batch-etl-airflow/dags:/opt/airflow/dags
+      - ../batch-etl-airflow/plugins:/opt/airflow/plugins
+      - ../batch-etl-airflow/logs:/opt/airflow/logs
+
+  # Adminer (PostgreSQL UI)
+  adminer:
+    image: adminer:latest
+    container_name: adminer
+    ports:
+      - "5050:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # RedPanda Console (Kafka / RedPanda UI)
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v3.5.2
+    container_name: redpanda-console
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      SCHEMAREGISTRY_ENABLED: "true"
+      SCHEMAREGISTRY_URLS: http://redpanda:8081
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # RedisInsight (Redis UI)
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: redisinsight
+    ports:
+      - "8081:5540"
+    environment:
+      RI_REDIS_HOST: redis
+      RI_REDIS_PORT: "6379"
+      RI_REDIS_ALIAS: "gourmetgram-redis"
+    volumes:
+      - redisinsight_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Nimtable (Iceberg Table Browser) - Backend
+  nimtable:
+    image: ghcr.io/nimtable/nimtable:nightly
+    container_name: nimtable
+    restart: unless-stopped
+    ports:
+      - "8182:8182"
+    environment:
+      JAVA_OPTS: -Xmx2g -Xms256m
+    volumes:
+      - ./nimtable-config.yaml:/nimtable/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Nimtable (Iceberg Table Browser) - Frontend
+  nimtable-web:
+    image: ghcr.io/nimtable/nimtable-web:nightly
+    container_name: nimtable-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      JAVA_API_URL: http://nimtable:8182
+      DATABASE_URL: postgresql://nimtable_user:gourmetgram_nimtable@postgres:5432/nimtable
+      JWT_SECRET: nimtable-lab-jwt-secret
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: gourmetgram_nimtable
+    depends_on:
+      - nimtable
+
+volumes:
+  postgres_data:
+  minio_data:
+  food11:
+  redis_data:
+  redisinsight_data:
