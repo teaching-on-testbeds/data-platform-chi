@@ -6,3 +6,16 @@ author :
   feedburner : nil
 
 theme: jekyll-theme-cayman
+
+exclude:
+  - docker/
+  - api_v1/
+  - api_v2/
+  - data_generator/
+  - stream_consumer/
+  - inference_service/
+  - model_training/
+  - scripts/
+  - batch-etl-airflow/logs/
+  - batch-etl-airflow/plugins/
+  - batch-etl-airflow/__pycache__/
