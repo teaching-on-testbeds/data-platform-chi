@@ -357,7 +357,7 @@ For keys like `total_flags`, `total_comments`, and `total_views`, the key type i
 
 This image will have triggered the stream consumer to write an event to `moderation_requests`. In Redpanda Console, click `gourmetgram.moderation_requests` and verify at least one message includes the same `IMAGE_ID`.
 
-The risk scoring service will have read the request from Redpand, applied some heuristic to compute a risk score, and produced an output. In risk scoring logs (`docker logs -f risk-scoring-service`), confirm the scoring request and stored moderation output for the same `IMAGE_ID`. 
+The risk scoring service will have read the request from Redpanda, applied a heuristic to compute a risk score, and produced an output. In risk scoring logs (`docker logs -f risk-scoring-service`), confirm the scoring request and stored moderation output for the same `IMAGE_ID`.
 
 In Adminer (`http://A.B.C.D:5050`), log in with `PostgreSQL` / `postgres` / `user` / `gourmetgram_postgres` / `gourmetgram`, then run the SQL below and confirm the same `IMAGE_ID` appears in `target_id`.
 
