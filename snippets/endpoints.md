@@ -75,6 +75,8 @@ In the docs page:
 3. Review the example request fields.
 4. Click Cancel (or do not execute) and repeat for other endpoints.
 
+Take screenshots for later reference.
+
 These endpoints are "dummy" in the sense that we haven't built any application logic on top of them, but they model the core application workflow we need for the rest of the lab.
 
 :::
@@ -112,6 +114,9 @@ Go back to Adminer (`http://A.B.C.D:5050`) and log in with:
 - Database: `gourmetgram`
 
 Then, confirm that records are accumulating in the `comments`, `flags`, `images`, and `users` tables, and that in the `images` table, some images are accumulating views. (Click on a table, then "Select data" to see the data in the table.)
+
+Take screenshots of Adminer table views for `comments`, `flags`, `images`, and `users` as well as example rows from each table.
+
 
 In MinIO (`http://A.B.C.D:9001`):
 

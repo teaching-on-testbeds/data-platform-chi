@@ -439,6 +439,8 @@ In the docs page:
 3. Review the example request fields.
 4. Click Cancel (or do not execute) and repeat for other endpoints.
 
+Take screenshots for later reference.
+
 These endpoints are "dummy" in the sense that we haven't built any application logic on top of them, but they model the core application workflow we need for the rest of the lab.
 
 
@@ -472,6 +474,9 @@ Go back to Adminer (`http://A.B.C.D:5050`) and log in with:
 - Database: `gourmetgram`
 
 Then, confirm that records are accumulating in the `comments`, `flags`, `images`, and `users` tables, and that in the `images` table, some images are accumulating views. (Click on a table, then "Select data" to see the data in the table.)
+
+Take screenshots of Adminer table views for `comments`, `flags`, `images`, and `users` as well as example rows from each table.
+
 
 In MinIO (`http://A.B.C.D:9001`):
 
@@ -801,6 +806,9 @@ with an image ID. Copy the image ID printed by the script. We will call this val
 
 ### Step 4: Trace one viral item through the real-time flow
 
+
+Now, you will trace this item through the real-time data flow, and you will take screenshots at each stage.
+
 In the Redpanda Console, which is open at `http://A.B.C.D:8090`, let's follow the same `IMAGE_ID` across services:
 
 First, in Redpanda Console, click Topics -> `gourmetgram.views`, then use the message filter/search box to search for `IMAGE_ID` and confirm burst view events arrived.
@@ -969,15 +977,17 @@ Then,
 2. Open namespace `event_aggregations`.
 3. Confirm the three `*_windows_5min` tables are visible.
 
-We are just browsing a catalog of data that is in the lakehouse, but the underlying storage is in MinIO.
+Take screenshots for later reference.
 
-To see the underlying storage right after this Redpanda aggregation run:
+We are just browsing a catalog of data that is in the lakehouse, but the underlying storage is in MinIO. To see the underlying storage right after this Redpanda aggregation run:
 
 1. Open MinIO Console at `http://A.B.C.D:9001` and log in (`admin` / `gourmetgram_minio`).
 2. Click Object Browser, then open bucket `gourmetgram-datalake`.
 3. Open folder `warehouse/event_aggregations/` and then one table folder such as `view_windows_5min/`.
 4. Open `data/` to see Parquet files that store the data.
 5. Open `metadata/` to see Iceberg metadata files (schemas, snapshots, file manifests).
+
+Take screenshots for later reference.
 
 Also inspect the watermark Variable in PostgreSQL via Adminer:
 
@@ -1181,6 +1191,8 @@ At the end of the notebook, we save artifacts locally in the mounted workspace. 
 * `metadata.json`
 
 Open `metadata.json` and note `snapshot_id`: this is the exact Iceberg snapshot used for the training run.
+
+Save `metadata.json` for later reference.
 
 
 

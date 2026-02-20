@@ -147,15 +147,17 @@ Then,
 2. Open namespace `event_aggregations`.
 3. Confirm the three `*_windows_5min` tables are visible.
 
-We are just browsing a catalog of data that is in the lakehouse, but the underlying storage is in MinIO.
+Take screenshots for later reference.
 
-To see the underlying storage right after this Redpanda aggregation run:
+We are just browsing a catalog of data that is in the lakehouse, but the underlying storage is in MinIO. To see the underlying storage right after this Redpanda aggregation run:
 
 1. Open MinIO Console at `http://A.B.C.D:9001` and log in (`admin` / `gourmetgram_minio`).
 2. Click Object Browser, then open bucket `gourmetgram-datalake`.
 3. Open folder `warehouse/event_aggregations/` and then one table folder such as `view_windows_5min/`.
 4. Open `data/` to see Parquet files that store the data.
 5. Open `metadata/` to see Iceberg metadata files (schemas, snapshots, file manifests).
+
+Take screenshots for later reference.
 
 Also inspect the watermark Variable in PostgreSQL via Adminer:
 

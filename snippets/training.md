@@ -112,4 +112,6 @@ At the end of the notebook, we save artifacts locally in the mounted workspace. 
 
 Open `metadata.json` and note `snapshot_id`: this is the exact Iceberg snapshot used for the training run.
 
+Save `metadata.json` for later reference.
+
 :::

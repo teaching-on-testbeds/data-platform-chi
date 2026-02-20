@@ -337,6 +337,9 @@ with an image ID. Copy the image ID printed by the script. We will call this val
 
 ### Step 4: Trace one viral item through the real-time flow
 
+
+Now, you will trace this item through the real-time data flow, and you will take screenshots at each stage.
+
 In the Redpanda Console, which is open at `http://A.B.C.D:8090`, let's follow the same `IMAGE_ID` across services:
 
 First, in Redpanda Console, click Topics -> `gourmetgram.views`, then use the message filter/search box to search for `IMAGE_ID` and confirm burst view events arrived.
