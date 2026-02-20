@@ -339,12 +339,6 @@ services:
       - REDIS_PORT=6379
       - REDIS_DB=0
       - DATABASE_URL=postgresql://user:gourmetgram_postgres@postgres:5432/gourmetgram
-      - S3_ENDPOINT_URL=http://minio:9000
-      - AWS_ACCESS_KEY_ID=admin
-      - AWS_SECRET_ACCESS_KEY=gourmetgram_minio
-      - MODEL_BUCKET=gourmetgram-datalake
-      - MODEL_PREFIX=models/moderation/
-      - MODEL_CHECK_INTERVAL=30
       - LOG_LEVEL=INFO
     depends_on:
       redpanda:
@@ -517,6 +511,33 @@ services:
       ADMIN_PASSWORD: gourmetgram_nimtable
     depends_on:
       - nimtable
+
+  # Jupyter notebook for model training
+  jupyter:
+    build:
+      context: ../model_training
+      dockerfile: Dockerfile
+    container_name: jupyter
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    environment:
+      - PYICEBERG_CATALOG__GOURMETGRAM__TYPE=sql
+      - PYICEBERG_CATALOG__GOURMETGRAM__URI=postgresql+psycopg2://user:gourmetgram_postgres@postgres:5432/iceberg_catalog
+      - PYICEBERG_CATALOG__GOURMETGRAM__S3__ENDPOINT=http://minio:9000
+      - PYICEBERG_CATALOG__GOURMETGRAM__S3__ACCESS_KEY_ID=admin
+      - PYICEBERG_CATALOG__GOURMETGRAM__S3__SECRET_ACCESS_KEY=gourmetgram_minio
+      - PYICEBERG_CATALOG__GOURMETGRAM__WAREHOUSE=s3://gourmetgram-datalake/warehouse
+      - S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=gourmetgram_minio
+    volumes:
+      - ../model_training/workspace:/home/jovyan/work
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
 
 volumes:
   postgres_data:

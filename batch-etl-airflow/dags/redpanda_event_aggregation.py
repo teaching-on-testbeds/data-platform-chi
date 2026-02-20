@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.models import Variable
 import os
 import logging
+import json
 
 # DAG default arguments
 default_args = {
@@ -22,10 +24,36 @@ dag = DAG(
     schedule_interval=timedelta(hours=1),  # Run every hour
     start_date=datetime(2023, 1, 1),
     catchup=False,
+    max_active_runs=1,
 )
 
 # Path to isolated iceberg venv python (built in Dockerfile)
 ICEBERG_PYTHON = '/home/airflow/iceberg_venv/bin/python.real'
+CHECKPOINT_VAR = 'redpanda_event_aggregation_checkpoint'
+
+
+def load_checkpoint():
+    checkpoint = Variable.get(CHECKPOINT_VAR, default_var=None, deserialize_json=True)
+    if checkpoint is None:
+        return None
+    if not isinstance(checkpoint, dict):
+        logging.warning("Checkpoint variable is not a JSON object. Ignoring and bootstrapping from earliest.")
+        return None
+    if 'offsets' not in checkpoint:
+        logging.warning("Checkpoint variable missing 'offsets'. Ignoring and bootstrapping from earliest.")
+        return None
+    return checkpoint
+
+
+def save_checkpoint(offsets, run_id):
+    payload = {
+        'version': 1,
+        'offsets': offsets,
+        'updated_at': datetime.utcnow().isoformat() + 'Z',
+        'last_run_id': run_id,
+        'bootstrap': 'earliest',
+    }
+    Variable.set(CHECKPOINT_VAR, payload, serialize_json=True)
 
 # Inline script that runs inside the iceberg venv subprocess
 ICEBERG_WRITE_SCRIPT = '''
@@ -82,19 +110,11 @@ logging.info(f"Wrote {len(df)} rows to {identifier}")
 
 
 def consume_and_aggregate_events(**kwargs):
-    import json
-    from kafka import KafkaConsumer, TopicPartition
+    from kafka import KafkaConsumer
     from collections import defaultdict
     from datetime import datetime, timezone
-    import pandas as pd
 
     logging.info("=== Starting Redpanda Event Aggregation ===")
-
-    # Calculate time range: last hour
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(hours=1)
-
-    logging.info(f"Processing events from {start_time} to {end_time}")
 
     # Initialize Kafka consumer
     bootstrap_servers = 'redpanda:9092'
@@ -108,32 +128,56 @@ def consume_and_aggregate_events(**kwargs):
         bootstrap_servers=bootstrap_servers,
         auto_offset_reset='earliest',
         enable_auto_commit=False,  # Manual commit after successful processing
-        consumer_timeout_ms=30000,  # 30 second timeout for polling
+        consumer_timeout_ms=1000,
         value_deserializer=lambda m: json.loads(m.decode('utf-8')),
         group_id='airflow_event_aggregator'
     )
 
-    # Get all partitions and seek to timestamp
-    partitions = consumer.assignment()
+    # Assignment happens lazily
+    consumer.poll(timeout_ms=1000)
+    partitions = sorted(consumer.assignment(), key=lambda tp: (tp.topic, tp.partition))
     if not partitions:
-        # Assignment happens lazily, trigger with poll
-        consumer.poll(timeout_ms=1000)
-        partitions = consumer.assignment()
+        consumer.close()
+        raise RuntimeError("No Kafka partitions assigned for event aggregation topics")
 
     logging.info(f"Assigned partitions: {partitions}")
 
-    # Seek to start timestamp
-    start_timestamp_ms = int(start_time.timestamp() * 1000)
-    offset_dict = consumer.offsets_for_times(
-        {tp: start_timestamp_ms for tp in partitions}
-    )
+    checkpoint = load_checkpoint()
+    checkpoint_offsets = checkpoint.get('offsets', {}) if checkpoint else {}
+    is_first_run = checkpoint is None
 
-    for tp, offset_and_timestamp in offset_dict.items():
-        if offset_and_timestamp:
-            logging.info(f"Seeking {tp} to offset {offset_and_timestamp.offset}")
-            consumer.seek(tp, offset_and_timestamp.offset)
-        else:
-            logging.warning(f"No offset found for {tp} at timestamp {start_time}")
+    if is_first_run:
+        logging.info("No checkpoint found. Bootstrapping from earliest offsets.")
+    else:
+        logging.info("Loaded checkpoint from Airflow Variable '%s'.", CHECKPOINT_VAR)
+
+    beginning_offsets = consumer.beginning_offsets(partitions)
+    end_offsets = consumer.end_offsets(partitions)
+    start_offsets = {}
+
+    for tp in partitions:
+        topic_offsets = checkpoint_offsets.get(tp.topic, {})
+        stored = topic_offsets.get(str(tp.partition))
+        start_offset = int(stored) if stored is not None else beginning_offsets.get(tp, 0)
+        end_offset = end_offsets.get(tp, start_offset)
+
+        if start_offset > end_offset:
+            logging.warning(
+                "Checkpoint offset %s is ahead of end offset %s for %s. Clamping to end.",
+                start_offset,
+                end_offset,
+                tp,
+            )
+            start_offset = end_offset
+
+        start_offsets[tp] = start_offset
+        consumer.seek(tp, start_offset)
+        logging.info(
+            "Partition %s start_offset=%s end_offset=%s",
+            tp,
+            start_offset,
+            end_offset,
+        )
 
     # Aggregation buckets: {image_id: {bucket_start: count}}
     view_windows = defaultdict(lambda: defaultdict(int))
@@ -142,87 +186,120 @@ def consume_and_aggregate_events(**kwargs):
 
     # Event counters
     events_read = 0
-    events_in_range = 0
+    events_processed = 0
     events_skipped = 0
 
-    logging.info("Starting to consume events...")
+    active_partitions = {
+        tp for tp in partitions if start_offsets[tp] < end_offsets.get(tp, start_offsets[tp])
+    }
 
-    for message in consumer:
-        events_read += 1
+    if not active_partitions:
+        logging.info("No new offsets to process for this run.")
 
-        try:
-            event = message.value
-            topic = message.topic
+    logging.info("Starting to consume events from checkpoint to run boundary...")
+    empty_polls = 0
 
-            # Parse timestamp from event
-            if topic == 'gourmetgram.views':
-                timestamp_str = event.get('viewed_at')
-                image_id = event.get('image_id')
-            elif topic == 'gourmetgram.comments':
-                timestamp_str = event.get('created_at')
-                image_id = event.get('image_id')
-            elif topic == 'gourmetgram.flags':
-                timestamp_str = event.get('created_at')
-                image_id = event.get('image_id')
-                # Skip comment flags (no image_id)
-                if not image_id:
+    while active_partitions:
+        polled = consumer.poll(timeout_ms=1000, max_records=1000)
+
+        if not polled:
+            empty_polls += 1
+        else:
+            empty_polls = 0
+
+        for _, messages in polled.items():
+            for message in messages:
+                events_read += 1
+                event = None
+
+                try:
+                    event = message.value
+                    topic = message.topic
+
+                    # Parse timestamp from event
+                    if topic == 'gourmetgram.views':
+                        timestamp_str = event.get('viewed_at')
+                        image_id = event.get('image_id')
+                    elif topic == 'gourmetgram.comments':
+                        timestamp_str = event.get('created_at')
+                        image_id = event.get('image_id')
+                    elif topic == 'gourmetgram.flags':
+                        timestamp_str = event.get('created_at')
+                        image_id = event.get('image_id')
+                        # Skip comment flags (no image_id)
+                        if not image_id:
+                            events_skipped += 1
+                            continue
+                    else:
+                        events_skipped += 1
+                        continue
+
+                    # Parse timestamp
+                    if isinstance(timestamp_str, str):
+                        # Handle ISO format with or without timezone
+                        if timestamp_str.endswith('Z'):
+                            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        elif '+' in timestamp_str or timestamp_str.endswith('00:00'):
+                            timestamp = datetime.fromisoformat(timestamp_str)
+                        else:
+                            timestamp = datetime.fromisoformat(timestamp_str).replace(tzinfo=timezone.utc)
+                    else:
+                        # Assume it's already a datetime
+                        timestamp = timestamp_str
+                        if timestamp.tzinfo is None:
+                            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+                    events_processed += 1
+
+                    # Calculate 5-minute bucket
+                    # Floor to nearest 5-minute interval
+                    bucket_start = timestamp.replace(
+                        minute=(timestamp.minute // 5) * 5,
+                        second=0,
+                        microsecond=0
+                    )
+
+                    # Increment count for this (image_id, bucket) pair
+                    if topic == 'gourmetgram.views':
+                        view_windows[str(image_id)][bucket_start] += 1
+                    elif topic == 'gourmetgram.comments':
+                        comment_windows[str(image_id)][bucket_start] += 1
+                    elif topic == 'gourmetgram.flags':
+                        flag_windows[str(image_id)][bucket_start] += 1
+
+                except Exception as e:
+                    logging.error(f"Error processing event: {e}")
+                    logging.error(f"Event: {event}")
                     events_skipped += 1
                     continue
-            else:
-                events_skipped += 1
-                continue
 
-            # Parse timestamp
-            if isinstance(timestamp_str, str):
-                # Handle ISO format with or without timezone
-                if timestamp_str.endswith('Z'):
-                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                elif '+' in timestamp_str or timestamp_str.endswith('00:00'):
-                    timestamp = datetime.fromisoformat(timestamp_str)
-                else:
-                    timestamp = datetime.fromisoformat(timestamp_str).replace(tzinfo=timezone.utc)
-            else:
-                # Assume it's already a datetime
-                timestamp = timestamp_str
-                if timestamp.tzinfo is None:
-                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+        remaining = set()
+        for tp in active_partitions:
+            position = consumer.position(tp)
+            if position < end_offsets[tp]:
+                remaining.add(tp)
+        active_partitions = remaining
 
-            # Skip events outside our time range
-            if timestamp < start_time:
-                continue  # Haven't reached start yet
-            if timestamp >= end_time:
-                # We've passed the end time, stop consuming
-                break
-
-            events_in_range += 1
-
-            # Calculate 5-minute bucket
-            # Floor to nearest 5-minute interval
-            bucket_start = timestamp.replace(
-                minute=(timestamp.minute // 5) * 5,
-                second=0,
-                microsecond=0
+        if empty_polls >= 30 and active_partitions:
+            consumer.close()
+            raise RuntimeError(
+                f"Timed out waiting for records before run boundary. Remaining partitions: {active_partitions}"
             )
 
-            # Increment count for this (image_id, bucket) pair
-            if topic == 'gourmetgram.views':
-                view_windows[str(image_id)][bucket_start] += 1
-            elif topic == 'gourmetgram.comments':
-                comment_windows[str(image_id)][bucket_start] += 1
-            elif topic == 'gourmetgram.flags':
-                flag_windows[str(image_id)][bucket_start] += 1
+    next_offsets = {}
+    for tp in partitions:
+        position = consumer.position(tp)
+        bounded_position = min(position, end_offsets[tp])
+        bounded_position = max(bounded_position, start_offsets[tp])
+        next_offsets.setdefault(tp.topic, {})[str(tp.partition)] = int(bounded_position)
 
-        except Exception as e:
-            logging.error(f"Error processing event: {e}")
-            logging.error(f"Event: {event}")
-            events_skipped += 1
-            continue
+    logging.info("Next checkpoint offsets: %s", next_offsets)
 
     consumer.close()
 
     logging.info(f"=== Consumption Complete ===")
     logging.info(f"Events read: {events_read}")
-    logging.info(f"Events in time range: {events_in_range}")
+    logging.info(f"Events processed: {events_processed}")
     logging.info(f"Events skipped: {events_skipped}")
     logging.info(f"View windows: {sum(len(buckets) for buckets in view_windows.values())}")
     logging.info(f"Comment windows: {sum(len(buckets) for buckets in comment_windows.values())}")
@@ -256,6 +333,8 @@ def consume_and_aggregate_events(**kwargs):
     ti.xcom_push(key='view_windows', value=view_records)
     ti.xcom_push(key='comment_windows', value=comment_records)
     ti.xcom_push(key='flag_windows', value=flag_records)
+    ti.xcom_push(key='next_offsets', value=next_offsets)
+    ti.xcom_push(key='is_first_run', value=is_first_run)
 
 
 def _run_iceberg_write(table_name, records):
@@ -322,6 +401,19 @@ def write_flag_windows(**kwargs):
     _run_iceberg_write('flag_windows_5min', records)
 
 
+def commit_checkpoint(**kwargs):
+    ti = kwargs['ti']
+    dag_run = kwargs.get('dag_run')
+
+    next_offsets = ti.xcom_pull(key='next_offsets', task_ids='consume_and_aggregate_events')
+    if not next_offsets:
+        raise RuntimeError("Missing next_offsets in XCom; refusing to advance checkpoint")
+
+    run_id = dag_run.run_id if dag_run else 'manual_unknown_run'
+    save_checkpoint(next_offsets, run_id)
+    logging.info("Checkpoint committed to Airflow Variable '%s' for run %s", CHECKPOINT_VAR, run_id)
+
+
 # Define tasks
 t1_consume = PythonOperator(
     task_id='consume_and_aggregate_events',
@@ -347,7 +439,13 @@ t4_write_flags = PythonOperator(
     dag=dag,
 )
 
+t5_commit_checkpoint = PythonOperator(
+    task_id='commit_checkpoint',
+    python_callable=commit_checkpoint,
+    dag=dag,
+)
+
 # Define dependencies
 # Consume events first, then write each table sequentially.
 # This avoids first-run catalog table creation races in SQL catalog backends.
-t1_consume >> t2_write_views >> t3_write_comments >> t4_write_flags
+t1_consume >> t2_write_views >> t3_write_comments >> t4_write_flags >> t5_commit_checkpoint

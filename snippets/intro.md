@@ -1,7 +1,7 @@
 
 ::: {.cell .markdown}
 
-# Data platform on Chameleon
+# Data platforms on Chameleon
 
 You are an engineer at GourmetGram, a startup where users upload food photos, write captions, and interact through views, comments, and flags. GourmetGram is in a major growth phase, thanks in part to our previous infrastructure and MLOps work.
 
@@ -16,5 +16,13 @@ In this lab, we will build that platform progressively:
 * Finally, we will train and deploy a moderation model and compare model-based decisions with heuristic decisions.
 
 To run this lab, we should already have a Chameleon account, be part of a project, and have an SSH key uploaded to KVM@TACC.
+
+Before we begin, open this experiment artifact on Trovi:
+
+* [Data platforms on Chameleon (Trovi artifact)](https://trovi.chameleoncloud.org/dashboard/artifacts/3aca301f-22f7-4929-88c4-4b666f3d4c92)
+
+Then follow along with the published lab page:
+
+* [Data platforms on Chameleon](https://teaching-on-testbeds.github.io/data-platform-chi/)
 
 :::

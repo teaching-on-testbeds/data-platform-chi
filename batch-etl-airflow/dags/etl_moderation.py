@@ -97,18 +97,139 @@ def transform_features(**kwargs):
     flags['created_at'] = pd.to_datetime(flags['created_at'], utc=True)
     users['created_at'] = pd.to_datetime(users['created_at'], utc=True)
 
-    # Merge images with users for user features
-    images = images.merge(users[['id', 'created_at']], left_on='user_id', right_on='id', suffixes=('', '_user'))
+    # Normalize IDs to strings for stable joins/comparisons
+    for df, cols in [
+        (users, ['id']),
+        (images, ['id', 'user_id']),
+        (comments, ['id', 'image_id', 'user_id']),
+        (flags, ['id', 'image_id', 'user_id']),
+    ]:
+        for col in cols:
+            if col in df.columns:
+                df[col] = df[col].astype(str)
+
+    # -------------------------------
+    # Governance filters for training
+    # -------------------------------
+    # We apply these at write time so moderation.training_data is policy-aligned
+    # and all downstream training readers use the same governed dataset.
+
+    users['is_test_account'] = users['is_test_account'].fillna(False).astype(bool)
+    users['year_of_birth'] = pd.to_numeric(users['year_of_birth'], errors='coerce')
+
+    # Merge image uploader attributes needed for eligibility filtering
+    images = images.merge(
+        users[['id', 'created_at', 'is_test_account', 'year_of_birth']],
+        left_on='user_id',
+        right_on='id',
+        suffixes=('', '_user')
+    )
     images.rename(columns={'created_at_user': 'user_created_at'}, inplace=True)
 
-    # Load windowed aggregations from Iceberg
+    upload_year = images['created_at'].dt.year
+    uploader_is_test = images['is_test_account'].fillna(False).astype(bool)
+    uploader_is_child = images['year_of_birth'].notna() & ((upload_year - images['year_of_birth']) < 18)
+    image_is_deleted = images['deleted_at'].notna() if 'deleted_at' in images.columns else pd.Series(False, index=images.index)
+
+    eligible_images_mask = (~uploader_is_test) & (~uploader_is_child) & (~image_is_deleted)
+
+    logging.info("Image eligibility filtering summary:")
+    logging.info(f"  total images before filter: {len(images)}")
+    logging.info(f"  excluded uploader test account: {int(uploader_is_test.sum())}")
+    logging.info(f"  excluded uploader child account: {int(uploader_is_child.sum())}")
+    logging.info(f"  excluded deleted images: {int(image_is_deleted.sum())}")
+
+    images = images[eligible_images_mask].copy()
+    logging.info(f"  images remaining for training: {len(images)}")
+
+    # Apply the same account policy to comment/flag actors.
+    # Unknown age is allowed; known child accounts are excluded.
+    actor_policy = users[['id', 'is_test_account', 'year_of_birth']].rename(columns={'id': 'actor_id'})
+
+    comments = comments.merge(actor_policy, how='left', left_on='user_id', right_on='actor_id')
+    comments['is_test_account'] = comments['is_test_account'].fillna(False).astype(bool)
+    comments['year_of_birth'] = pd.to_numeric(comments['year_of_birth'], errors='coerce')
+    comment_year = comments['created_at'].dt.year
+    comment_is_child = comments['year_of_birth'].notna() & ((comment_year - comments['year_of_birth']) < 18)
+    comment_deleted = comments['deleted_at'].notna() if 'deleted_at' in comments.columns else pd.Series(False, index=comments.index)
+    comments = comments[(~comments['is_test_account']) & (~comment_is_child) & (~comment_deleted)].copy()
+
+    flags = flags.merge(actor_policy, how='left', left_on='user_id', right_on='actor_id')
+    flags['is_test_account'] = flags['is_test_account'].fillna(False).astype(bool)
+    flags['year_of_birth'] = pd.to_numeric(flags['year_of_birth'], errors='coerce')
+    flag_year = flags['created_at'].dt.year
+    flag_is_child = flags['year_of_birth'].notna() & ((flag_year - flags['year_of_birth']) < 18)
+    flags = flags[(~flags['is_test_account']) & (~flag_is_child)].copy()
+
+    logging.info("Actor filtering summary:")
+    logging.info(f"  comments remaining after policy filters: {len(comments)}")
+    logging.info(f"  flags remaining after policy filters: {len(flags)}")
+
+    # Load windowed aggregations from Iceberg using isolated pyiceberg venv
+    # (Airflow base env does not include pyiceberg due dependency conflicts).
     logging.info("Loading windowed aggregations from Iceberg...")
     try:
-        from pyiceberg.catalog import load_catalog
-        catalog = load_catalog("gourmetgram")
-        view_windows_df = catalog.load_table("event_aggregations.view_windows_5min").scan().to_pandas()
-        comment_windows_df = catalog.load_table("event_aggregations.comment_windows_5min").scan().to_pandas()
-        flag_windows_df = catalog.load_table("event_aggregations.flag_windows_5min").scan().to_pandas()
+        import json
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="moderation_training_windows_") as tmp_dir:
+            output_paths = {
+                'view': f"{tmp_dir}/view_windows_5min.parquet",
+                'comment': f"{tmp_dir}/comment_windows_5min.parquet",
+                'flag': f"{tmp_dir}/flag_windows_5min.parquet",
+            }
+
+            iceberg_read_script = '''
+import json
+import pandas as pd
+from pyiceberg.catalog import load_catalog
+
+input_data = json.loads(input())
+paths = input_data["output_paths"]
+
+catalog = load_catalog("gourmetgram")
+
+view_df = catalog.load_table("event_aggregations.view_windows_5min").scan().to_pandas()
+comment_df = catalog.load_table("event_aggregations.comment_windows_5min").scan().to_pandas()
+flag_df = catalog.load_table("event_aggregations.flag_windows_5min").scan().to_pandas()
+
+view_df.to_parquet(paths["view"], index=False)
+comment_df.to_parquet(paths["comment"], index=False)
+flag_df.to_parquet(paths["flag"], index=False)
+
+print(json.dumps({
+    "view_rows": len(view_df),
+    "comment_rows": len(comment_df),
+    "flag_rows": len(flag_df),
+}))
+'''
+
+            subprocess_env = {
+                'HOME': os.environ.get('HOME', '/home/airflow'),
+                'PATH': '/usr/local/bin:/usr/bin:/bin',
+                'PYTHONNOUSERSITE': '1',
+            }
+            for key, val in os.environ.items():
+                if key.startswith('PYICEBERG_CATALOG__'):
+                    subprocess_env[key] = val
+
+            result = subprocess.run(
+                [ICEBERG_PYTHON, '-I', '-c', iceberg_read_script],
+                input=json.dumps({'output_paths': output_paths}),
+                capture_output=True,
+                text=True,
+                env=subprocess_env,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "unknown subprocess error")
+
+            stats = json.loads(result.stdout.strip().splitlines()[-1]) if result.stdout.strip() else {}
+
+            view_windows_df = pd.read_parquet(output_paths['view'])
+            comment_windows_df = pd.read_parquet(output_paths['comment'])
+            flag_windows_df = pd.read_parquet(output_paths['flag'])
 
         # Ensure timestamps are datetime and string IDs
         view_windows_df['window_start'] = pd.to_datetime(view_windows_df['window_start'], utc=True)
@@ -123,8 +244,12 @@ def transform_features(**kwargs):
         flag_windows_df['window_end'] = pd.to_datetime(flag_windows_df['window_end'], utc=True)
         flag_windows_df['image_id'] = flag_windows_df['image_id'].astype(str)
 
-        logging.info(f"Loaded {len(view_windows_df)} view windows, {len(comment_windows_df)} comment windows, {len(flag_windows_df)} flag windows")
-        use_iceberg = True
+        logging.info(
+            "Loaded %s view windows, %s comment windows, %s flag windows",
+            stats.get('view_rows', len(view_windows_df)),
+            stats.get('comment_rows', len(comment_windows_df)),
+            stats.get('flag_rows', len(flag_windows_df)),
+        )
     except Exception as e:
         raise RuntimeError(f"Could not load required Iceberg window tables: {e}")
 

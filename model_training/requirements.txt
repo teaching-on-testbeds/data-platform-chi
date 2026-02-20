@@ -1,0 +1,4 @@
+pyiceberg[s3fs,sql-postgres]
+pyarrow
+psycopg2-binary
+boto3
