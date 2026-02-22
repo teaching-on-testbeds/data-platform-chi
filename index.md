@@ -831,7 +831,7 @@ This image will have triggered the stream consumer to write an event to `moderat
 
 The risk scoring service will have read the request from Redpanda, applied a heuristic to compute a risk score, and produced an output. In risk scoring logs (`docker logs -f risk-scoring-service`), confirm the scoring request and stored moderation output for the same `IMAGE_ID`.
 
-In Adminer (`http://A.B.C.D:5050`), log in with `PostgreSQL` / `postgres` / `user` / `gourmetgram_postgres` / `gourmetgram`, then run the SQL below and confirm the same `IMAGE_ID` appears in `target_id`.
+In Adminer (`http://A.B.C.D:5050`), log in with `PostgreSQL` / `postgres` / `user` / `gourmetgram_postgres` / `gourmetgram`, then confirm the same `IMAGE_ID` appears in `target_id` for a row in the `moderation` table.
 
 
 
